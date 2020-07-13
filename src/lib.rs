@@ -9,7 +9,9 @@ use {
         thread,
         net,
         sync::Arc,
-        collections::HashMap,
+        collections::{
+            HashMap,
+        },
     },
     futures::{
         future,
@@ -52,7 +54,7 @@ pub struct ServerRoom {
     capacity: u8,
     board: Board,
     current_player: String,
-    players: HashMap<String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool)>,
+    players: Vec<(String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool))>,
 }
 
 pub fn spawn_smol_thread(name: &str) -> std::io::Result<Thread> {
@@ -135,7 +137,7 @@ async fn spawn_room(room_name: String, capacity: u8, size_x: u8, size_y: u8) -> 
         capacity,
         current_player: "".to_owned(),
         board: Board::new(size_x as usize, size_y as usize),
-        players: HashMap::new(),
+        players: Vec::new(),
     };
 
     let (handle_room_abortable, abort_handler) = future::abortable(handle_room(rx, room_name.clone(), room));
@@ -199,8 +201,10 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                     RoomCommand::PlayerQuery(mut client_tx, username) => {
                         let mut player_exists = false;
 
-                        if let Some(_) = room.players.get(&username) {
-                            player_exists = true;
+                        for player in room.players.iter() {
+                            if player.0 == username {
+                                player_exists = true;
+                            }
                         }
 
                         if let Err(e) = client_tx.send(RoomCommand::PlayerQueryResponse(player_exists)).await {
@@ -212,16 +216,16 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                         let mut stone = Stone::Black;
                         
                         if room.players.len() > 0 {
-                            if let Some((_, player)) = room.players.iter().nth(room.players.len() - 1) {
-                                stone = other_cell(player.1.stone);
+                            if let Some(player) = room.players.get(room.players.len() - 1) {
+                                stone = other_cell((player.1).1.stone);
                             }
                         } else {
                             room.current_player = username.clone();
                         }
 
-                        let mut players = HashMap::new();
+                        let mut players = Vec::new();
                         room.players.iter()
-                            .for_each(|(key, val)| { players.insert(key.clone(), val.1.clone()); });
+                            .for_each(|(key, val)| { players.push((key.clone(), val.1.clone())); });
 
                         let new_player = Player {
                             username: username.clone(),
@@ -229,7 +233,7 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                             stone
                         };
 
-                        players.insert(username.clone(), new_player.clone());
+                        players.push((username.clone(), new_player.clone()));
 
                         let send_room = Room {
                             players,
@@ -250,7 +254,7 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                             }
                         }
 
-                        room.players.insert(username.clone(), (user_tx.clone(), new_player, false));
+                        room.players.push((username.clone(), (user_tx.clone(), new_player, false)));
 
                         if let Err(e) = user_tx.send(ServerMessage::LoginResponse(Ok(send_room))).await {
                             warn!("Room `{}`: Username `{}`: Unable to send room message to user: {}", room_name, username, e);
@@ -258,17 +262,57 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                     }
 
                     RoomCommand::PlayerRemove(username) => {
-                        if let Some(userdata) = room.players.get_mut(&username) {
-                            if let Err(e) = userdata.0.close().await {
+                        let mut player: Option<&mut (String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool))> = None;
+                        let mut index = 0;
+
+                        for (i, other_player) in room.players.iter_mut().enumerate() {
+                            if other_player.0 == username {
+                                player = Some(other_player);
+                                index = i;
+                            }
+                        }
+
+                        if let Some(userdata) = player {
+                            if let Err(e) = (userdata.1).0.close().await {
                                 error!("Room `{}`: Username `{}`: Unable to remove user: {}", room_name, username, e);
                             }
-                            room.players.remove(&username);
+                            
+                            if username == room.current_player {
+                                let mut next_player = match room.players.get(0) {
+                                    None => {
+                                        warn!("Room `{}`: Unable to get first player in room", room_name);
+                                        continue;
+                                    }
+
+                                    Some((player_name, _)) => player_name.clone()
+                                };
+
+                                let mut iter = room.players.iter();
+
+                                for (player_name, _) in &mut iter {
+                                    if username == *player_name {
+                                        break;
+                                    }
+                                }
+
+                                if let Some((player_name, _)) = iter.next() {
+                                    next_player = player_name.to_string();
+                                }
+
+                                room.current_player = next_player;
+                            }
+
+                            room.players.remove(index);
 
                             let quit_message = "`".to_owned() + &username + "` has left the room";
 
                             for (_, player) in room.players.iter_mut() {
                                 if let Err(e) = player.0.send(ServerMessage::PlayerRemove(username.clone())).await {
                                     warn!("Room `{}`: Username `{}`: Unable to send room message to user: {}", room_name, username, e);
+                                }
+
+                                if let Err(e) = player.0.send(ServerMessage::NextTurn(room.current_player.clone())).await {
+                                    unable_send_data(&room_name[..], &username[..], &e);
                                 }
 
                                 if let Err(e) = player.0.send(ServerMessage::Chat(quit_message.clone())).await {
@@ -291,13 +335,21 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                             match action {
                                 // Place Stone
                                 Some(position) => {
-                                    let player = match room.players.get(&username) {
+                                    let mut player: Option<(String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool))> = None;
+
+                                    for other_player in room.players.iter() {
+                                        if other_player.0 == username {
+                                            player = Some(other_player.clone());
+                                        }
+                                    }
+
+                                    let player = match player {
                                         None => {
                                             warn!("Room `{}`: Username `{}`: Unable to find userdata in room", room_name, username);
                                             continue;
                                         }
 
-                                        Some(player_value) => player_value
+                                        Some(player_value) => player_value.1
                                     };
 
                                     let stone = player.1.stone;
@@ -365,30 +417,38 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                                 None => {
                                     let pass = ServerMessage::PlaceResponse(Ok(Move(None, Some(username.clone()))));
 
-                                    let mut next_player = match room.players.iter().nth(0) {
+                                    let mut next_player = match room.players.get(0) {
                                         None => {
                                             warn!("Room `{}`: Unable to get first player in room", room_name);
                                             continue;
                                         }
 
-                                        Some((player_name, _)) => player_name.clone()
+                                        Some(player_name) => player_name.0.clone()
                                     };
 
                                     let mut iter = room.players.iter();
 
-                                    for (player_name, _) in &mut iter {
-                                        if username == *player_name {
+                                    for other_player_name in &mut iter {
+                                        if other_player_name.0 == username {
                                             break;
                                         }
                                     }
 
-                                    if let Some((player_name, _)) = iter.next() {
-                                        next_player = player_name.to_string();
+                                    if let Some(other_player) = iter.next() {
+                                        next_player = other_player.0.to_string();
                                     }
 
                                     room.current_player = next_player.clone();
 
-                                    let player = match room.players.get_mut(&username) {
+                                    let mut player: Option<&mut (String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool))> = None;
+
+                                    for other_player in room.players.iter_mut() {
+                                        if other_player.0 == username {
+                                            player = Some(other_player);
+                                        }
+                                    }
+
+                                    let player: &mut (String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool)) = match player {
                                         None => {
                                             warn!("Room `{}`: Username: `{}`: Unable to find userdata in room", room_name, username);
                                             continue;
@@ -397,7 +457,7 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                                         Some(player_value) => player_value
                                     };
 
-                                    player.2 = true;
+                                    (player.1).2 = true;
 
                                     for (_, player) in room.players.iter_mut() {
                                         if let Err(e) = player.0.send(pass.clone()).await {
@@ -407,25 +467,39 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
 
                                     let mut done = true;
 
-                                    for (_, player) in room.players.iter() {
-                                        if ! player.2 {
+                                    for player in room.players.iter() {
+                                        if ! (player.1).2 {
                                             done = false;
                                         }
                                     }
                                     
                                     if done {
-                                        break;
+                                        for player in room.players.iter_mut() {
+                                            if let Err(e) = (player.1).0.close().await {
+                                                error!("Room `{}`: Username `{}`: Unable to remove user: {}", room_name, username, e);
+                                            }
+                                        }
+
+                                        //break;
                                     }
                                 }
                             }
                         } else {
-                            let player = match room.players.get_mut(&username) {
+                            let mut player: Option<(String, (mpsc::UnboundedSender::<ServerMessage>, Player, bool))> = None;
+
+                            for other_player in room.players.iter() {
+                                if other_player.0 == username {
+                                    player = Some(other_player.clone());
+                                }
+                            }
+
+                            let mut player = match player {
                                 None => {
                                     warn!("Room `{}`: Username: `{}`: Unable to find userdata in room", room_name, username);
                                     continue;
                                 }
 
-                                Some(player_value) => player_value
+                                Some(player_value) => player_value.1
                             };
 
                             if let Err(e) = player.0.send(ServerMessage::PlaceResponse(Err(InvalidMove::InvalidTurn))).await {
@@ -443,7 +517,15 @@ async fn handle_room(mut rx: RoomReceiver, room_name: String, mut room: ServerRo
                     }
 
                     _ => {
-                        if let Some(userdata) = room.players.get_mut(&username) {
+                        let mut player: Option<(mpsc::UnboundedSender::<ServerMessage>, Player, bool)> = None;
+
+                        for other_player in room.players.iter() {
+                            if other_player.0 == username {
+                                player = Some(other_player.clone().1);
+                            }
+                        }
+
+                        if let Some(mut userdata) = player {
                             if let Err(e) = userdata.0.send(ServerMessage::AlreadyLoggedIn).await {
                                 unable_send_data(&room_name[..], &username[..], &e);
                             }

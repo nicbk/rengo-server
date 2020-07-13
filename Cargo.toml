@@ -3,6 +3,8 @@ name = "rengo-server"
 version = "0.1.0"
 authors = ["xrop <xrop@xrop.me>"]
 edition = "2018"
+description = "Rengo server application"
+repository = "https://gitlab.com/xrop/rengo-server.git"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
