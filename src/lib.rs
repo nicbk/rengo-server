@@ -647,7 +647,7 @@ pub async fn connection_handle(raw_stream: Async<net::TcpStream>,
                                                            ServerMessage::LoginResponse(
                                                                Err(LoginError::UsernameTooLong))).await?;
 
-                            } else if room_name.chars().count() > 8 {
+                            } else if room_name.chars().count() > 16 {
                                 trace!("[{}]: Room name too long", socket_addr);
                                 connection_handle_send_msg(&mut ws_stream,
                                                            ServerMessage::LoginResponse(
@@ -690,7 +690,7 @@ pub async fn connection_handle(raw_stream: Async<net::TcpStream>,
                         }
 
                         ClientMessage::RoomCreate(room_name, capacity, size_x, size_y) => {
-                            if room_name.chars().count() > 8 {
+                            if room_name.chars().count() > 16 {
                                 trace!("[{}]: Room name too long", socket_addr);
                                 connection_handle_send_msg(&mut ws_stream,
                                                            ServerMessage::RoomCreateResponse(
